@@ -32,27 +32,9 @@ import concurrent.futures
 
 # from .bitcoin import Hash, hash_encode
 from .transaction import Transaction
-from .util import ThreadJob, bh2u, PrintError
+from .util import ThreadJob, bh2u, PrintError, aiosafe
 from .bitcoin import address_to_scripthash
 
-class SynchronizerJob(ThreadJob):
-    def __init__(self, wallet):
-        self.wallet = wallet
-        self.synchronizer = Synchronizer(wallet)
-
-    def run(self):
-       if self.synchronizer.future.done():
-           try:
-               self.synchronizer.future.result()
-           except:
-               traceback.print_exc()
-               async def stop():
-                   asyncio.get_event_loop().stop()
-               try:
-                   asyncio.run_coroutine_threadsafe(stop(), self.wallet.network.asyncio_loop).result(1)
-               except concurrent.futures.TimeoutError:
-                   pass
-               #self.wallet.network.remove_jobs(self)
 
 class NotificationSession(ClientSession):
 
@@ -68,6 +50,7 @@ class NotificationSession(ClientSession):
             self.q.put_nowait((self.scripthash_to_address[args[0]],) + args[1:] + ("notification",))
         return put_in_queue
 
+
 class Synchronizer(PrintError):
     '''The synchronizer keeps the wallet up-to-date with its set of
     addresses and their transactions.  It subscribes over the network
@@ -78,11 +61,10 @@ class Synchronizer(PrintError):
     '''
     def __init__(self, wallet):
         self.wallet = wallet
-        self.requested_histories = {}
         self.requested_tx = {}
+        self.requested_histories = {}
         self.requested_addrs = set()
         self.scripthash_to_address = {}
-        self.future = asyncio.run_coroutine_threadsafe(self.main(), wallet.network.asyncio_loop)
 
     def is_up_to_date(self):
         return (not self.requested_tx and not self.requested_histories
@@ -98,9 +80,7 @@ class Synchronizer(PrintError):
             b.add_request('blockchain.scripthash.subscribe', [h])
 
         self.session.send_batch(b)
-
         await b
-
         return zip(addresses, b)
 
     def get_status(self, h):
@@ -232,6 +212,7 @@ class Synchronizer(PrintError):
                 self.wallet.network.trigger_callback('updated')
                 was_up_to_date = up2date
 
+    @aiosafe
     async def main(self):
         subscription_replies = asyncio.Queue()
 

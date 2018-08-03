@@ -932,3 +932,16 @@ VerifiedTxInfo = NamedTuple("VerifiedTxInfo", [("height", int),
                                                ("timestamp", int),
                                                ("txpos", int),
                                                ("header_hash", str)])
+
+def aiosafe(f):
+    # save exception in object.
+    # f must be a method of a PrintError instance.
+    # aiosafe calls should not be nested
+    async def f2(*args, **kwargs):
+        self = args[0]
+        try:
+            return await f(*args, **kwargs)
+        except BaseException as e:
+            self.print_error("Exception in", f.__name__, ":", e.__class__.__name__, str(e))
+            self.exception = e
+    return f2

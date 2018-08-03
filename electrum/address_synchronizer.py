@@ -22,6 +22,7 @@
 # SOFTWARE.
 
 import threading
+import asyncio
 import itertools
 from collections import defaultdict
 
@@ -29,7 +30,7 @@ from . import bitcoin
 from .bitcoin import COINBASE_MATURITY, TYPE_ADDRESS, TYPE_PUBKEY
 from .util import PrintError, profiler, bfh, VerifiedTxInfo, TxMinedStatus
 from .transaction import Transaction, TxOutput
-from .synchronizer import SynchronizerJob
+from .synchronizer import Synchronizer
 from .verifier import SPV
 from .blockchain import hash_header
 from .i18n import _
@@ -137,15 +138,16 @@ class AddressSynchronizer(PrintError):
         self.network = network
         if self.network is not None:
             self.verifier = SPV(self.network, self)
-            self.synchronizer = SynchronizerJob(self)
-            network.add_jobs([self.verifier, self.synchronizer])
+            self.synchronizer = Synchronizer(self)
+            network.add_jobs([self.verifier])
+            self.network.futures.append(asyncio.run_coroutine_threadsafe(self.synchronizer.main(), self.network.asyncio_loop))
         else:
             self.verifier = None
             self.synchronizer = None
 
     def stop_threads(self):
         if self.network:
-            self.network.remove_jobs([self.synchronizer, self.verifier])
+            self.network.remove_jobs([self.verifier])
             self.synchronizer = None
             self.verifier = None
             # Now no references to the synchronizer or verifier
