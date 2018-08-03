@@ -34,6 +34,7 @@ import concurrent.futures
 from .transaction import Transaction
 from .util import ThreadJob, bh2u, PrintError, aiosafe
 from .bitcoin import address_to_scripthash
+from .version import ELECTRUM_VERSION, PROTOCOL_VERSION
 
 
 class NotificationSession(ClientSession):
@@ -183,13 +184,16 @@ class Synchronizer(PrintError):
         b = self.session.new_batch()
         for h in hashes:
             b.add_request('blockchain.transaction.get', [h])
-
         self.session.send_batch(b)
-
         await b
-
         for h, rep in zip(hashes, b):
             self.on_tx_response([h], rep.result())
+
+    async def send_version(self):
+        b = self.session.new_batch()
+        b.add_request('server.version', [ELECTRUM_VERSION, PROTOCOL_VERSION])
+        self.session.send_batch(b)
+        await b
 
     async def synchronize_and_subscribe(self, subscription_replies, new_addresses=None):
         if new_addresses is None:
@@ -221,11 +225,10 @@ class Synchronizer(PrintError):
         try:
             conn = self.wallet.network.default_server
             host, port, protocol = conn.split(':')
-            assert protocol == 's'
-            sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
+            sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if protocol == 's' else None
             async with NotificationSession(subscription_replies, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
                 self.session = session
-
+                await self.send_version()
                 self.wallet.synchronizer = self
                 self.add = lambda x: None
                 self.wallet.synchronize()
