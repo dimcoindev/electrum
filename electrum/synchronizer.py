@@ -164,8 +164,6 @@ class Synchronizer(PrintError):
                          (tx_hash, tx_height, len(tx.raw)))
         # callbacks
         self.wallet.network.trigger_callback('new_transaction', tx)
-        if not self.requested_tx:
-            self.wallet.network.trigger_callback('updated')
 
     async def request_missing_txs(self, hist):
         # "hist" is a list of [tx_hash, tx_height] lists
@@ -206,40 +204,27 @@ class Synchronizer(PrintError):
             for adr, fut in res:
                 subscription_replies.put_nowait((adr, fut.result(), "direct response"))
 
-    async def check_update(self):
-        was_up_to_date = False
-        while True:
-            await asyncio.sleep(1)
-            up2date = self.is_up_to_date()
-            if up2date != was_up_to_date:
-                self.wallet.set_up_to_date(up2date)
-                self.wallet.network.trigger_callback('updated')
-                was_up_to_date = up2date
-
     @aiosafe
     async def main(self):
         subscription_replies = asyncio.Queue()
-
-        task = asyncio.get_event_loop().create_task(self.check_update())
-
-        try:
-            conn = self.wallet.network.default_server
-            host, port, protocol = conn.split(':')
-            sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if protocol == 's' else None
-            async with NotificationSession(subscription_replies, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
-                self.session = session
-                await self.send_version()
-                self.wallet.synchronizer = self
-                self.add = lambda x: None
-                self.wallet.synchronize()
-                del self.add
-                adrs = self.wallet.get_addresses()
-                await self.synchronize_and_subscribe(subscription_replies, adrs)
-
-                while True:
-                    args = await subscription_replies.get()
-                    await self.on_address_status([args[0]], args[1])
-                    if subscription_replies.qsize() == 0:
-                        await self.synchronize_and_subscribe(subscription_replies)
-        finally:
-            task.cancel()
+        conn = self.wallet.network.default_server
+        host, port, protocol = conn.split(':')
+        sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if protocol == 's' else None
+        async with NotificationSession(subscription_replies, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
+            self.session = session
+            await self.send_version()
+            self.wallet.synchronizer = self
+            self.add = lambda x: None
+            self.wallet.synchronize()
+            del self.add
+            adrs = self.wallet.get_addresses()
+            await self.synchronize_and_subscribe(subscription_replies, adrs)
+            while True:
+                args = await subscription_replies.get()
+                await self.on_address_status([args[0]], args[1])
+                if subscription_replies.qsize() == 0:
+                    await self.synchronize_and_subscribe(subscription_replies)
+                up_to_date = self.is_up_to_date()
+                if up_to_date != self.wallet.is_up_to_date():
+                    self.wallet.set_up_to_date(up_to_date)
+                    self.wallet.network.trigger_callback('updated')
