@@ -140,6 +140,8 @@ class AddressSynchronizer(PrintError):
             self.verifier = SPV(self.network, self)
             self.synchronizer = Synchronizer(self)
             network.add_jobs([self.verifier])
+            self.network.futures.append(asyncio.run_coroutine_threadsafe(self.synchronizer.send_subscriptions(), self.network.asyncio_loop))
+            self.network.futures.append(asyncio.run_coroutine_threadsafe(self.synchronizer.handle_status(), self.network.asyncio_loop))
             self.network.futures.append(asyncio.run_coroutine_threadsafe(self.synchronizer.main(), self.network.asyncio_loop))
         else:
             self.verifier = None

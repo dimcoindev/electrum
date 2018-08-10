@@ -25,7 +25,7 @@
 import traceback
 import ssl
 import asyncio
-from aiorpcx import ClientSession
+from aiorpcx import ClientSession, Request, Notification, TaskGroup
 from threading import Lock
 import hashlib
 import concurrent.futures
@@ -39,18 +39,18 @@ from .version import ELECTRUM_VERSION, PROTOCOL_VERSION
 
 class NotificationSession(ClientSession):
 
-    def __init__(self, subscription_replies, scripthash_to_address, *args, **kwargs):
+    def __init__(self, queue, scripthash_to_address, *args, **kwargs):
         super(NotificationSession, self).__init__(*args, **kwargs)
-        self.q = subscription_replies
+        self.queue = queue
         self.scripthash_to_address = scripthash_to_address
 
-    def notification_handler(self, method):
-        if method != "blockchain.scripthash.subscribe":
-            return None
-        def put_in_queue(*args):
-            self.q.put_nowait((self.scripthash_to_address[args[0]],) + args[1:] + ("notification",))
-        return put_in_queue
+    @aiosafe
+    async def handle_request(self, request):
+        if isinstance(request, Notification):
+            if request.metthod == 'blockchain.scripthash.subscribe':
+                self.queue.put_nowait((self.scripthash_to_address[args[0]], args[1]))
 
+    
 
 class Synchronizer(PrintError):
     '''The synchronizer keeps the wallet up-to-date with its set of
@@ -66,23 +66,20 @@ class Synchronizer(PrintError):
         self.requested_histories = {}
         self.requested_addrs = set()
         self.scripthash_to_address = {}
+        #
+        self.add_queue = asyncio.Queue()
+        self.status_queue = asyncio.Queue()
+
+    async def send_version(self):
+        r = await self.session.send_request('server.version', [ELECTRUM_VERSION, PROTOCOL_VERSION])
+        print(r)
 
     def is_up_to_date(self):
         return (not self.requested_tx and not self.requested_histories
                 and not self.requested_addrs)
 
-    async def subscribe_to_addresses(self, addresses):
-        self.print_error("subscribing to", len(addresses), "addresses")
-
-        b = self.session.new_batch()
-        for address in addresses:
-            h = address_to_scripthash(address)
-            self.scripthash_to_address[h] = address
-            b.add_request('blockchain.scripthash.subscribe', [h])
-
-        self.session.send_batch(b)
-        await b
-        return zip(addresses, b)
+    def add(self, addr):
+        self.add_queue.put_nowait(addr)
 
     def get_status(self, h):
         if not h:
@@ -92,28 +89,26 @@ class Synchronizer(PrintError):
             status += tx_hash + ':%d:' % height
         return bh2u(hashlib.sha256(status.encode('ascii')).digest())
 
-    async def on_address_status(self, params, result):
-        addr = params[0]
+
+    async def on_address_status(self, addr, status):
         history = self.wallet.history.get(addr, [])
-        if self.get_status(history) != result:
-            # note that at this point 'result' can be None;
-            # if we had a history for addr but now the server is telling us
-            # there is no history
-            if addr not in self.requested_histories:
-                self.requested_histories[addr] = result
+        if self.get_status(history) == status:
+            return
+        # note that at this point 'result' can be None;
+        # if we had a history for addr but now the server is telling us
+        # there is no history
+        if addr not in self.requested_histories:
+            self.requested_histories[addr] = status
+            # request_address_history
+            sch = address_to_scripthash(addr)
+            hist = await self.session.send_request("blockchain.scripthash.get_history", [sch])
+            await self.on_address_history(addr, hist)
 
-                # request_address_history
-                sch = address_to_scripthash(addr)
-                req = self.session.send_request("blockchain.scripthash.get_history", [sch])
-                await req
-
-                await self.on_address_history([addr], req.result())
         # remove addr from list only after it is added to requested_histories
         if addr in self.requested_addrs:  # Notifications won't be in
             self.requested_addrs.remove(addr)
 
-    async def on_address_history(self, params, result):
-        addr = params[0]
+    async def on_address_history(self, addr, result):
         server_status = self.requested_histories[addr]
         self.print_error("receiving history", addr, len(result))
         hashes = set(map(lambda item: item['tx_hash'], result))
@@ -141,13 +136,28 @@ class Synchronizer(PrintError):
                 transaction_hashes.append(tx_hash)
                 self.requested_tx[tx_hash] = tx_height
 
-            if transaction_hashes != []:
-                await self.get_transactions(transaction_hashes)
+            for tx_hash in transaction_hashes:
+                await self.get_transaction(tx_hash)
+
         # Remove request; this allows up_to_date to be True
         self.requested_histories.pop(addr)
 
-    def on_tx_response(self, params, result):
-        tx_hash = params[0]
+    async def request_missing_txs(self, hist):
+        # "hist" is a list of [tx_hash, tx_height] lists
+        transaction_hashes = []
+        for tx_hash, tx_height in hist:
+            if tx_hash in self.requested_tx:
+                continue
+            if tx_hash in self.wallet.transactions:
+                continue
+            transaction_hashes.append(tx_hash)
+            self.requested_tx[tx_hash] = tx_height
+
+        for tx_hash in transaction_hashes:
+            await self.get_transaction(tx_hash)
+
+    async def get_transaction(self, tx_hash):
+        result = await self.session.send_request('blockchain.transaction.get', [tx_hash])
         tx = Transaction(result)
         try:
             tx.deserialize()
@@ -164,66 +174,41 @@ class Synchronizer(PrintError):
                          (tx_hash, tx_height, len(tx.raw)))
         # callbacks
         self.wallet.network.trigger_callback('new_transaction', tx)
+        print('new tx', tx_hash)
 
-    async def request_missing_txs(self, hist):
-        # "hist" is a list of [tx_hash, tx_height] lists
-        transaction_hashes = []
-        for tx_hash, tx_height in hist:
-            if tx_hash in self.requested_tx:
-                continue
-            if tx_hash in self.wallet.transactions:
-                continue
-            transaction_hashes.append(tx_hash)
-            self.requested_tx[tx_hash] = tx_height
+    async def subscribe_to_address(self, addr):
+        h = address_to_scripthash(addr)
+        self.scripthash_to_address[h] = addr
+        status = await self.session.send_request('blockchain.scripthash.subscribe', [h])
+        self.status_queue.put((addr, status))
 
-        if transaction_hashes != []: await self.get_transactions(transaction_hashes)
+    @aiosafe
+    async def send_subscriptions(self):
+        async with TaskGroup() as group:
+            while True:
+                addr = await self.add_queue.get()
+                await group.spawn(self.subscribe_to_address(addr))
 
-    async def get_transactions(self, hashes):
-        b = self.session.new_batch()
-        for h in hashes:
-            b.add_request('blockchain.transaction.get', [h])
-        self.session.send_batch(b)
-        await b
-        for h, rep in zip(hashes, b):
-            self.on_tx_response([h], rep.result())
-
-    async def send_version(self):
-        b = self.session.new_batch()
-        b.add_request('server.version', [ELECTRUM_VERSION, PROTOCOL_VERSION])
-        self.session.send_batch(b)
-        await b
-
-    async def synchronize_and_subscribe(self, subscription_replies, new_addresses=None):
-        if new_addresses is None:
-            new_addresses = []
-            self.add = new_addresses.append
-            self.wallet.synchronize()
-            del self.add
-        if len(new_addresses) > 0:
-            res = await self.subscribe_to_addresses(new_addresses)
-            for adr, fut in res:
-                subscription_replies.put_nowait((adr, fut.result(), "direct response"))
+    @aiosafe
+    async def handle_status(self):
+        async with TaskGroup() as group:
+            while True:
+                addr, status = await self.status_queue.get()
+                await group.spawn(self.on_address_status(addr, status))
 
     @aiosafe
     async def main(self):
-        subscription_replies = asyncio.Queue()
         conn = self.wallet.network.default_server
         host, port, protocol = conn.split(':')
         sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if protocol == 's' else None
-        async with NotificationSession(subscription_replies, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
+        async with NotificationSession(self.status_queue, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
             self.session = session
             await self.send_version()
             self.wallet.synchronizer = self
-            self.add = lambda x: None
-            self.wallet.synchronize()
-            del self.add
-            adrs = self.wallet.get_addresses()
-            await self.synchronize_and_subscribe(subscription_replies, adrs)
+            for addr in self.wallet.get_addresses(): self.add(addr)
             while True:
-                args = await subscription_replies.get()
-                await self.on_address_status([args[0]], args[1])
-                if subscription_replies.qsize() == 0:
-                    await self.synchronize_and_subscribe(subscription_replies)
+                await asyncio.sleep(1)
+                self.wallet.synchronize()
                 up_to_date = self.is_up_to_date()
                 if up_to_date != self.wallet.is_up_to_date():
                     self.wallet.set_up_to_date(up_to_date)
