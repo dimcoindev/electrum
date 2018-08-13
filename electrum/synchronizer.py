@@ -47,9 +47,9 @@ class NotificationSession(ClientSession):
     @aiosafe
     async def handle_request(self, request):
         if isinstance(request, Notification):
-            if request.metthod == 'blockchain.scripthash.subscribe':
+            if request.method == 'blockchain.scripthash.subscribe':
+                args = request.args
                 self.queue.put_nowait((self.scripthash_to_address[args[0]], args[1]))
-
     
 
 class Synchronizer(PrintError):
