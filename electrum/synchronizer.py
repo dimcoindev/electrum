@@ -48,7 +48,7 @@ class NotificationSession(ClientSession):
         if isinstance(request, Notification):
             if request.method == 'blockchain.scripthash.subscribe':
                 args = request.args
-                self.queue.put_nowait((args[0], args[1]))
+                await self.queue.put((args[0], args[1]))
     
 
 class Synchronizer(PrintError):
@@ -177,7 +177,7 @@ class Synchronizer(PrintError):
         h = address_to_scripthash(addr)
         self.scripthash_to_address[h] = addr
         status = await self.session.send_request('blockchain.scripthash.subscribe', [h])
-        self.status_queue.put((h, status))
+        await self.status_queue.put((h, status))
 
     @aiosafe
     async def send_subscriptions(self):
