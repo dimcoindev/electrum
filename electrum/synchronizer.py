@@ -37,6 +37,16 @@ from .bitcoin import address_to_scripthash
 from .version import ELECTRUM_VERSION, PROTOCOL_VERSION
 
 
+def history_status(h):
+    if not h:
+        return None
+    status = ''
+    for tx_hash, height in h:
+        status += tx_hash + ':%d:' % height
+    return bh2u(hashlib.sha256(status.encode('ascii')).digest())
+
+
+
 class NotificationSession(ClientSession):
 
     def __init__(self, queue, *args, **kwargs):
@@ -73,41 +83,25 @@ class Synchronizer(PrintError):
         r = await self.session.send_request('server.version', [ELECTRUM_VERSION, PROTOCOL_VERSION])
 
     def is_up_to_date(self):
-        return (not self.requested_tx and not self.requested_histories
-                and not self.requested_addrs)
+        return (not self.requested_addrs and not self.requested_histories)
 
     def add(self, addr):
+        self.requested_addrs.add(addr)
         self.add_queue.put_nowait(addr)
-
-    def get_status(self, h):
-        if not h:
-            return None
-        status = ''
-        for tx_hash, height in h:
-            status += tx_hash + ':%d:' % height
-        return bh2u(hashlib.sha256(status.encode('ascii')).digest())
-
 
     async def on_address_status(self, addr, status):
         history = self.wallet.history.get(addr, [])
-        if self.get_status(history) == status:
+        if history_status(history) == status:
             return
         # note that at this point 'result' can be None;
         # if we had a history for addr but now the server is telling us
         # there is no history
-        if addr not in self.requested_histories:
-            self.requested_histories[addr] = status
-            # request_address_history
-            sch = address_to_scripthash(addr)
-            hist = await self.session.send_request("blockchain.scripthash.get_history", [sch])
-            await self.on_address_history(addr, hist)
-
-        # remove addr from list only after it is added to requested_histories
-        if addr in self.requested_addrs:  # Notifications won't be in
-            self.requested_addrs.remove(addr)
-
-    async def on_address_history(self, addr, result):
-        server_status = self.requested_histories[addr]
+        if addr in self.requested_histories:
+            return
+        # request address history
+        self.requested_histories[addr] = status
+        h = address_to_scripthash(addr)
+        result = await self.session.send_request("blockchain.scripthash.get_history", [h])
         self.print_error("receiving history", addr, len(result))
         hashes = set(map(lambda item: item['tx_hash'], result))
         hist = list(map(lambda item: (item['tx_hash'], item['height']), result))
@@ -118,7 +112,7 @@ class Synchronizer(PrintError):
         if len(hashes) != len(result):
             self.print_error("error: server history has non-unique txids: %s"% addr)
         # Check that the status corresponds to what was announced
-        elif self.get_status(hist) != server_status:
+        elif history_status(hist) != status:
             self.print_error("error: status mismatch: %s" % addr)
         else:
             # Store received history
@@ -178,6 +172,7 @@ class Synchronizer(PrintError):
         self.scripthash_to_address[h] = addr
         status = await self.session.send_request('blockchain.scripthash.subscribe', [h])
         await self.status_queue.put((h, status))
+        self.requested_addrs.remove(addr)
 
     @aiosafe
     async def send_subscriptions(self):
