@@ -39,17 +39,16 @@ from .version import ELECTRUM_VERSION, PROTOCOL_VERSION
 
 class NotificationSession(ClientSession):
 
-    def __init__(self, queue, scripthash_to_address, *args, **kwargs):
+    def __init__(self, queue, *args, **kwargs):
         super(NotificationSession, self).__init__(*args, **kwargs)
         self.queue = queue
-        self.scripthash_to_address = scripthash_to_address
 
     @aiosafe
     async def handle_request(self, request):
         if isinstance(request, Notification):
             if request.method == 'blockchain.scripthash.subscribe':
                 args = request.args
-                self.queue.put_nowait((self.scripthash_to_address[args[0]], args[1]))
+                self.queue.put_nowait((args[0], args[1]))
     
 
 class Synchronizer(PrintError):
@@ -66,13 +65,12 @@ class Synchronizer(PrintError):
         self.requested_histories = {}
         self.requested_addrs = set()
         self.scripthash_to_address = {}
-        #
+        # Queues
         self.add_queue = asyncio.Queue()
         self.status_queue = asyncio.Queue()
 
     async def send_version(self):
         r = await self.session.send_request('server.version', [ELECTRUM_VERSION, PROTOCOL_VERSION])
-        print(r)
 
     def is_up_to_date(self):
         return (not self.requested_tx and not self.requested_histories
@@ -174,13 +172,12 @@ class Synchronizer(PrintError):
                          (tx_hash, tx_height, len(tx.raw)))
         # callbacks
         self.wallet.network.trigger_callback('new_transaction', tx)
-        print('new tx', tx_hash)
 
     async def subscribe_to_address(self, addr):
         h = address_to_scripthash(addr)
         self.scripthash_to_address[h] = addr
         status = await self.session.send_request('blockchain.scripthash.subscribe', [h])
-        self.status_queue.put((addr, status))
+        self.status_queue.put((h, status))
 
     @aiosafe
     async def send_subscriptions(self):
@@ -193,7 +190,8 @@ class Synchronizer(PrintError):
     async def handle_status(self):
         async with TaskGroup() as group:
             while True:
-                addr, status = await self.status_queue.get()
+                h, status = await self.status_queue.get()
+                addr = self.scripthash_to_address[h]
                 await group.spawn(self.on_address_status(addr, status))
 
     @aiosafe
@@ -201,7 +199,7 @@ class Synchronizer(PrintError):
         conn = self.wallet.network.default_server
         host, port, protocol = conn.split(':')
         sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if protocol == 's' else None
-        async with NotificationSession(self.status_queue, self.scripthash_to_address, host, int(port), ssl=sslc) as session:
+        async with NotificationSession(self.status_queue, host, int(port), ssl=sslc) as session:
             self.session = session
             await self.send_version()
             self.wallet.synchronizer = self
